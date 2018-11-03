@@ -11,7 +11,6 @@ from setuptools import setup, find_packages
 exec(open('fastai/version.py').read())
 
 with open('README.md') as readme_file:   readme = readme_file.read()
-with open('CHANGES.md') as history_file: history = history_file.read()
 
 def to_list(buffer): return list(filter(None, map(str.strip, buffer.splitlines())))
 
@@ -24,28 +23,33 @@ def to_list(buffer): return list(filter(None, map(str.strip, buffer.splitlines()
 #
 # XXX: require torch>=1.0.0 once it's released, for now get the user to install it explicitly
 # XXX: using a workaround for torchvision, once torch-1.0.0 is out and a new torchvision depending on it is released switch to torchvision>=0.2.2
+# XXX: temporarily pinning spacy and its dependencies (regex, thinc, and cymem) to have a stable environment during the course duration.
 requirements = to_list("""
-    fastprogress>=0.1.10
+    fastprogress>=0.1.15
     ipython
     jupyter
     matplotlib
+    notebook>=5.7.0
     nbconvert
     nbformat
-    numpy>=1.15
+    numpy>=1.12
     pandas
     Pillow
     requests
     scipy
-    spacy
+    spacy==2.0.16
+    regex
+    thinc==6.12.0
+    cymem==2.0.2
     torchvision-nightly
     traitlets
     typing
+    pyyaml
 """)
 
 # dependencies to skip for now:
 #
 # cupy - is only required for QRNNs - sgguger thinks later he will get rid of this dep.
-# fire - will be eliminated shortly
 
 if sys.version_info < (3,7): requirements.append('dataclasses')
 
@@ -64,9 +68,10 @@ if sys.version_info < (3,7): requirements.append('dataclasses')
 # some of the listed modules appear in test_requirements as well, explained below.
 #
 dev_requirements = { 'dev' : to_list("""
+    coverage
     distro
     jupyter_contrib_nbextensions
-    pip>=18.1
+    pip>=9.0.1
     pipreqs>=0.4.9
     pytest
     wheel>=0.30.0
@@ -106,7 +111,7 @@ setup(
     test_suite = 'tests',
 
     description = "fastai makes deep learning with PyTorch faster, more accurate, and easier",
-    long_description = readme + '\n\n' + history,
+    long_description = readme,
     long_description_content_type = 'text/markdown',
     keywords = 'fastai, deep learning, machine learning',
 

@@ -1,7 +1,7 @@
 "`fastai.layers` provides essential functions to building and modifying `model` architectures"
 from .torch_core import *
 
-__all__ = ['AdaptiveConcatPool2d', 'CrossEntropyFlat', 'Debugger', 'Flatten', 'Lambda', 'PoolFlatten', 'ResizeBatch',
+__all__ = ['AdaptiveConcatPool2d', 'MSELossFlat', 'CrossEntropyFlat', 'Debugger', 'Flatten', 'Lambda', 'PoolFlatten', 'ResizeBatch',
            'StdUpsample', 'bn_drop_lin', 'conv2d', 'conv2d_relu', 'conv2d_trans', 'conv_layer', 'get_embedding', 'simple_cnn',
            'std_upsample_head', 'trunc_normal_']
 
@@ -83,7 +83,7 @@ class StdUpsample(nn.Module):
     def forward(self, x:Tensor) -> Tensor:
         return self.bn(F.relu(self.conv(x)))
 
-def std_upsample_head(c, *nfs:Collection[int]) -> Model:
+def std_upsample_head(c, *nfs:Collection[int]) -> nn.Module:
     "Create a sequence of upsample layers."
     return nn.Sequential(
         nn.ReLU(),
@@ -96,6 +96,11 @@ class CrossEntropyFlat(nn.CrossEntropyLoss):
     def forward(self, input:Tensor, target:Tensor) -> Rank0Tensor:
         n,c,*_ = input.shape
         return super().forward(input.view(n, c, -1), target.view(n, -1))
+
+class MSELossFlat(nn.MSELoss):
+    "Same as `nn.MSELoss`, but flattens input and target."
+    def forward(self, input:Tensor, target:Tensor) -> Rank0Tensor:
+        return super().forward(input.view(-1), target.view(-1))
 
 def simple_cnn(actns:Collection[int], kernel_szs:Collection[int]=None,
                strides:Collection[int]=None, bn=False) -> nn.Sequential:
@@ -113,7 +118,7 @@ def trunc_normal_(x:Tensor, mean:float=0., std:float=1.) -> Tensor:
     # From https://discuss.pytorch.org/t/implementing-truncated-normal-initializer/4778/12
     return x.normal_().fmod_(2).mul_(std).add_(mean)
 
-def get_embedding(ni:int,nf:int) -> Model:
+def get_embedding(ni:int,nf:int) -> nn.Module:
     "Create an embedding layer."
     emb = nn.Embedding(ni, nf)
     # See https://arxiv.org/abs/1711.09160

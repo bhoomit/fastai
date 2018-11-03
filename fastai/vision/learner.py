@@ -1,21 +1,34 @@
 "`Learner` support for computer vision"
 from ..torch_core import *
 from ..basic_train import *
-from ..data import *
+from ..basic_data import *
+from .image import *
+from . import models
+from ..callback import *
 from ..layers import *
-import torchvision.models as tvm
 
-__all__ = ['ConvLearner', 'create_body', 'create_head', 'num_features', 'ClassificationInterpretation']
+__all__ = ['ClassificationLearner', 'create_cnn', 'create_body', 'create_head', 'ClassificationInterpretation']
+# By default split models between first and second layer
+def _default_split(m:nn.Module): return (m[1],)
+# Split a resnet style model
+def _resnet_split(m:nn.Module): return (m[0][6],m[1])
 
-def create_body(model:Model, cut:Optional[int]=None, body_fn:Callable[[Model],Model]=None):
+_default_meta = {'cut':-1, 'split':_default_split}
+_resnet_meta  = {'cut':-2, 'split':_resnet_split }
+
+model_meta = {
+    models.resnet18 :{**_resnet_meta}, models.resnet34: {**_resnet_meta},
+    models.resnet50 :{**_resnet_meta}, models.resnet101:{**_resnet_meta},
+    models.resnet152:{**_resnet_meta}}
+
+def cnn_config(arch):
+    torch.backends.cudnn.benchmark = True
+    return model_meta.get(arch, _default_meta)
+
+def create_body(model:nn.Module, cut:Optional[int]=None, body_fn:Callable[[nn.Module],nn.Module]=None):
     "Cut off the body of a typically pretrained `model` at `cut` or as specified by `body_fn`."
     return (nn.Sequential(*list(model.children())[:cut]) if cut
             else body_fn(model) if body_fn else model)
-
-def num_features(m:Model)->int:
-    "Return the number of output features for a `model`."
-    for l in reversed(flatten_model(m)):
-        if hasattr(l, 'num_features'): return l.num_features
 
 def create_head(nf:int, nc:int, lin_ftrs:Optional[Collection[int]]=None, ps:Floats=0.5):
     """Model head that takes `nf` features, runs through `lin_ftrs`, and about `nc` classes.
@@ -29,75 +42,77 @@ def create_head(nf:int, nc:int, lin_ftrs:Optional[Collection[int]]=None, ps:Floa
         layers += bn_drop_lin(ni,no,True,p,actn)
     return nn.Sequential(*layers)
 
-# By default split models between first and second layer
-def _default_split(m:Model): return (m[1],)
-# Split a resnet style model
-def _resnet_split(m:Model): return (m[0][6],m[1])
+class ClassificationLearner(Learner):
+    def predict(self, img:Image):
+        "Return prect class, label and probabilities for `img`."
+        ds = self.data.valid_ds
+        ds.set_item(img)
+        res = self.pred_batch()[0]
+        ds.clear_item()
+        pred_max = res.argmax()
+        return self.data.classes[pred_max],pred_max,res
 
-_default_meta = {'cut':-1, 'split':_default_split}
-_resnet_meta  = {'cut':-2, 'split':_resnet_split }
-
-model_meta = {
-    tvm.resnet18 :{**_resnet_meta}, tvm.resnet34: {**_resnet_meta},
-    tvm.resnet50 :{**_resnet_meta}, tvm.resnet101:{**_resnet_meta},
-    tvm.resnet152:{**_resnet_meta}}
-
-class ConvLearner(Learner):
+def create_cnn(data:DataBunch, arch:Callable, cut:Union[int,Callable]=None, pretrained:bool=True,
+                lin_ftrs:Optional[Collection[int]]=None, ps:Floats=0.5,
+                custom_head:Optional[nn.Module]=None, split_on:Optional[SplitFuncOrIdxList]=None,
+                classification:bool=True, **kwargs:Any)->ClassificationLearner:
     "Build convnet style learners."
-    def __init__(self, data:DataBunch, arch:Callable, cut:Union[int,Callable]=None, pretrained:bool=True,
-                 lin_ftrs:Optional[Collection[int]]=None, ps:Floats=0.5,
-                 custom_head:Optional[nn.Module]=None, split_on:Optional[SplitFuncOrIdxList]=None, **kwargs:Any)->None:
-        meta = model_meta.get(arch, _default_meta)
-        torch.backends.cudnn.benchmark = True
-        body = create_body(arch(pretrained), ifnone(cut,meta['cut']))
-        nf = num_features(body) * 2
-        head = custom_head or create_head(nf, data.c, lin_ftrs, ps)
-        model = nn.Sequential(body, head)
-        super().__init__(data, model, **kwargs)
-        self.split(ifnone(split_on,meta['split']))
-        if pretrained: self.freeze()
-        apply_init(model[1], nn.init.kaiming_normal_)
+    assert classification, 'Regression CNN not implemented yet, bug us on the forums if you want this!'
+    meta = cnn_config(arch)
+    body = create_body(arch(pretrained), ifnone(cut,meta['cut']))
+    nf = num_features_model(body) * 2
+    head = custom_head or create_head(nf, data.c, lin_ftrs, ps)
+    model = nn.Sequential(body, head)
+    learn = ClassificationLearner(data, model, **kwargs)
+    learn.split(ifnone(split_on,meta['split']))
+    if pretrained: learn.freeze()
+    apply_init(model[1], nn.init.kaiming_normal_)
+    return learn
+
 
 class ClassificationInterpretation():
     "Interpretation methods for classification models."
-    def __init__(self, data:DataBunch, y_pred:Tensor, y_true:Tensor,
-                 loss_class:type=nn.CrossEntropyLoss, sigmoid:bool=True):
-        self.data,self.y_pred,self.y_true,self.loss_class = data,y_pred,y_true,loss_class
-        self.losses = calc_loss(y_pred, y_true, loss_class=loss_class)
-        self.probs = y_pred.sigmoid() if sigmoid else y_pred
+    def __init__(self, data:DataBunch, probs:Tensor, y_true:Tensor, losses:Tensor, sigmoid:bool=None):
+        if sigmoid is not None: warnings.warn("`sigmoid` argument is deprecated, the learner now always return the probabilities")
+        self.data,self.probs,self.y_true,self.losses = data,probs,y_true,losses
         self.pred_class = self.probs.argmax(dim=1)
 
     @classmethod
-    def from_learner(cls, learn:Learner, loss_class:type=nn.CrossEntropyLoss, sigmoid:bool=True, tta=False):
-        "Factory method to create from a Learner."
-        preds = learn.tta() if tta else learn.get_preds()
-        return cls(learn.data, *preds, loss_class=loss_class, sigmoid=sigmoid)
+    def from_learner(cls, learn:Learner, sigmoid:bool=None, tta=False):
+        "Create an instance of `ClassificationInterpretation`. `tta` indicates if we want to use Test Time Augmentation."
+        preds = learn.TTA(with_loss=True) if tta else learn.get_preds(with_loss=True)
+        return cls(learn.data, *preds, sigmoid=sigmoid)
 
-    def top_losses(self, k, largest=True):
-        "`k` largest(/smallest) losses."
-        return self.losses.topk(k, largest=largest)
+    def top_losses(self, k:int=None, largest=True):
+        "`k` largest(/smallest) losses and indexes, defaulting to all losses (sorted by `largest`)."
+        return self.losses.topk(ifnone(k, len(self.losses)), largest=largest)
 
     def plot_top_losses(self, k, largest=True, figsize=(12,12)):
-        "Show images in `top_losses` along with their loss, label, and prediction."
-        tl = self.top_losses(k,largest)
+        "Show images in `top_losses` along with their prediction, actual, loss, and probability of predicted class."
+        tl_val,tl_idx = self.top_losses(k,largest)
         classes = self.data.classes
         rows = math.ceil(math.sqrt(k))
         fig,axes = plt.subplots(rows,rows,figsize=figsize)
-        for i,idx in enumerate(self.top_losses(k, largest=largest)[1]):
+        fig.suptitle('prediction/actual/loss/probability', weight='bold', size=14)
+        for i,idx in enumerate(tl_idx):
             t=self.data.valid_ds[idx]
             t[0].show(ax=axes.flat[i], title=
                 f'{classes[self.pred_class[idx]]}/{classes[t[1]]} / {self.losses[idx]:.2f} / {self.probs[idx][t[1]]:.2f}')
 
-    def confusion_matrix(self):
+    def confusion_matrix(self, slice_size:int=None):
         "Confusion matrix as an `np.ndarray`."
         x=torch.arange(0,self.data.c)
-        cm = ((self.pred_class==x[:,None]) & (self.y_true==x[:,None,None])).sum(2)
+        cm = torch.zeros(self.data.c, self.data.c, dtype=x.dtype)
+        for pred_class_slice, y_true_slice in self._get_data_in_slices(slice_size or self.y_true.shape[0]):
+            cm_slice = ((pred_class_slice==x[:,None]) & (y_true_slice==x[:,None,None])).sum(2)
+            torch.add(cm, cm_slice, out=cm)
         return to_np(cm)
 
-    def plot_confusion_matrix(self, normalize:bool=False, title:str='Confusion matrix', cmap:Any="Blues", **kwargs)->None:
+    def plot_confusion_matrix(self, normalize:bool=False, title:str='Confusion matrix', cmap:Any="Blues", norm_dec:int=2, 
+                              slice_size:int=None, **kwargs)->None:
         "Plot the confusion matrix, passing `kawrgs` to `plt.figure`."
         # This function is mainly copied from the sklearn docs
-        cm = self.confusion_matrix()
+        cm = self.confusion_matrix(slice_size=slice_size)
         plt.figure(**kwargs)
         plt.imshow(cm, interpolation='nearest', cmap=cmap)
         plt.title(title)
@@ -108,17 +123,25 @@ class ClassificationInterpretation():
         if normalize: cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
         thresh = cm.max() / 2.
         for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-            plt.text(j, i, cm[i, j], horizontalalignment="center", color="white" if cm[i, j] > thresh else "black")
+            plt.text(j, i, f'{cm[i, j]:.{norm_dec}f}', horizontalalignment="center", color="white" if cm[i, j] > thresh else "black")
 
         plt.tight_layout()
         plt.ylabel('Actual')
         plt.xlabel('Predicted')
 
-    def most_confused(self, min_val:int=1)->Collection[Tuple[str,str,int]]:
+    def most_confused(self, min_val:int=1, slice_size:int=None)->Collection[Tuple[str,str,int]]:
         "Sorted descending list of largest non-diagonal entries of confusion matrix"
-        cm = self.confusion_matrix()
+        cm = self.confusion_matrix(slice_size=slice_size)
         np.fill_diagonal(cm, 0)
         res = [(self.data.classes[i],self.data.classes[j],cm[i,j])
                 for i,j in zip(*np.where(cm>min_val))]
         return sorted(res, key=itemgetter(2), reverse=True)
+
+    def _get_data_in_slices(self, slice_size:int):
+        "Slices data into slices of size slice_size."
+        iter_index = 0
+        while self.y_true.shape[0] >= iter_index*slice_size:
+            upper_bound = min(self.y_true.shape[0], (iter_index + 1) * slice_size)
+            yield self.pred_class[iter_index * slice_size:upper_bound], self.y_true[iter_index * slice_size:upper_bound]
+            iter_index +=1
 

@@ -1,6 +1,6 @@
 "Provides basic training and validation with `Learner`"
 from .torch_core import *
-from .data import *
+from .basic_data import *
 from .callback import *
 
 __all__ = ['Learner', 'LearnerCallback', 'Recorder', 'fit', 'loss_batch', 'train_epoch', 'validate',
@@ -9,19 +9,17 @@ __all__ = ['Learner', 'LearnerCallback', 'Recorder', 'fit', 'loss_batch', 'train
 default_lr = slice(3e-3)
 default_wd = 1e-2
 
-def loss_batch(model:Model, xb:Tensor, yb:Tensor, loss_fn:OptLossFunc=None,
-               opt:OptOptimizer=None, cb_handler:Optional[CallbackHandler]=None,
-               metrics:OptMetrics=None)->Tuple[Union[Tensor,int,float,str]]:
+def loss_batch(model:nn.Module, xb:Tensor, yb:Tensor, loss_func:OptLossFunc=None, opt:OptOptimizer=None,
+               cb_handler:Optional[CallbackHandler]=None)->Tuple[Union[Tensor,int,float,str]]:
     "Calculate loss and metrics for a batch, call out to callbacks as necessary."
-    if cb_handler is None: cb_handler = CallbackHandler([])
+    cb_handler = ifnone(cb_handler, CallbackHandler())
     if not is_listy(xb): xb = [xb]
     if not is_listy(yb): yb = [yb]
     out = model(*xb)
     out = cb_handler.on_loss_begin(out)
 
-    if not loss_fn: return to_detach(out), yb[0].detach()
-    loss = loss_fn(out, *yb)
-    mets = [f(out,*yb).detach().cpu() for f in metrics] if metrics is not None else []
+    if not loss_func: return to_detach(out), yb[0].detach()
+    loss = loss_func(out, *yb)
 
     if opt is not None:
         loss = cb_handler.on_backward_begin(loss)
@@ -31,30 +29,35 @@ def loss_batch(model:Model, xb:Tensor, yb:Tensor, loss_fn:OptLossFunc=None,
         cb_handler.on_step_end()
         opt.zero_grad()
 
-    return ((loss.detach().cpu(),) + tuple(mets))
+    return loss.detach().cpu()
 
-def get_preds(model:Model, dl:DataLoader, pbar:Optional[PBar]=None, cb_handler:Optional[CallbackHandler]=None) -> List[Tensor]:
-    "Predict the output of the elements in the dataloader."
-    return [torch.cat(o).cpu() for o in zip(*validate(model, dl, pbar=pbar, cb_handler=cb_handler, average=False))]
+def get_preds(model:nn.Module, dl:DataLoader, pbar:Optional[PBar]=None, cb_handler:Optional[CallbackHandler]=None,
+              activ:nn.Module=None, loss_func:OptLossFunc=None, n_batch:Optional[int]=None) -> List[Tensor]:
+    "Tuple of predictions and targets, and optional losses (if `loss_func`) using `dl`, max batches `n_batch`."
+    res = [torch.cat(o).cpu() for o in
+           zip(*validate(model, dl, cb_handler=cb_handler, pbar=pbar, average=False, n_batch=n_batch))]
+    if loss_func is not None: res.append(calc_loss(res[0], res[1], loss_func))
+    if activ is not None: res[0] = activ(res[0])
+    return res
 
-def validate(model:Model, dl:DataLoader, loss_fn:OptLossFunc=None,
-             metrics:OptMetrics=None, cb_handler:Optional[CallbackHandler]=None,
-             pbar:Optional[PBar]=None, average=True)->Iterator[Tuple[Union[Tensor,int],...]]:
+def validate(model:nn.Module, dl:DataLoader, loss_func:OptLossFunc=None, cb_handler:Optional[CallbackHandler]=None,
+             pbar:Optional[PBar]=None, average=True, n_batch:Optional[int]=None)->Iterator[Tuple[Union[Tensor,int],...]]:
     "Calculate loss and metrics for the validation set."
     model.eval()
     with torch.no_grad():
-        val_metrics,nums = [],[]
+        val_losses,nums = [],[]
         for xb,yb in progress_bar(dl, parent=pbar, leave=(pbar is not None)):
             if cb_handler: xb, yb = cb_handler.on_batch_begin(xb, yb, train=False)
-            val_metrics.append(loss_batch(model, xb, yb, loss_fn, cb_handler=cb_handler, metrics=metrics))
+            val_losses.append(loss_batch(model, xb, yb, loss_func, cb_handler=cb_handler))
             if not is_listy(yb): yb = [yb]
             nums.append(yb[0].shape[0])
-            if cb_handler and cb_handler.on_batch_end(val_metrics[0]): break
+            if cb_handler and cb_handler.on_batch_end(val_losses[-1]): break
+            if n_batch and (len(nums)>=n_batch): break
         nums = np.array(nums, dtype=np.float32)
-        if average: return [(to_np(torch.stack(val)) * nums).sum() / nums.sum() for val in zip(*val_metrics)]
-        else: return val_metrics
+        if average: return (to_np(torch.stack(val_losses)) * nums).sum() / nums.sum()
+        else:       return val_losses
 
-def train_epoch(model:Model, dl:DataLoader, opt:optim.Optimizer, loss_func:LossFunction)->None:
+def train_epoch(model:nn.Module, dl:DataLoader, opt:optim.Optimizer, loss_func:LossFunction)->None:
     "Simple training of `model` for 1 epoch of `dl` using optim `opt` and loss function `loss_func`."
     model.train()
     for xb,yb in dl:
@@ -63,10 +66,10 @@ def train_epoch(model:Model, dl:DataLoader, opt:optim.Optimizer, loss_func:LossF
         opt.step()
         opt.zero_grad()
 
-def fit(epochs:int, model:Model, loss_fn:LossFunction, opt:optim.Optimizer,
+def fit(epochs:int, model:nn.Module, loss_func:LossFunction, opt:optim.Optimizer,
         data:DataBunch, callbacks:Optional[CallbackList]=None, metrics:OptMetrics=None)->None:
     "Fit the `model` on `data` and learn using `loss` and `opt`."
-    cb_handler = CallbackHandler(callbacks)
+    cb_handler = CallbackHandler(callbacks, metrics)
     pbar = master_bar(range(epochs))
     cb_handler.on_train_begin(epochs, pbar=pbar, metrics=metrics)
 
@@ -78,26 +81,46 @@ def fit(epochs:int, model:Model, loss_fn:LossFunction, opt:optim.Optimizer,
 
             for xb,yb in progress_bar(data.train_dl, parent=pbar):
                 xb, yb = cb_handler.on_batch_begin(xb, yb)
-                loss = loss_batch(model, xb, yb, loss_fn, opt, cb_handler)[0]
+                loss = loss_batch(model, xb, yb, loss_func, opt, cb_handler)
                 if cb_handler.on_batch_end(loss): break
 
             if hasattr(data,'valid_dl') and data.valid_dl is not None:
-                val_metrics = validate(model, data.valid_dl, loss_fn=loss_fn,
-                                       cb_handler=cb_handler, metrics=metrics,pbar=pbar)
-            else: val_metrics=None
-            if cb_handler.on_epoch_end(val_metrics): break
+                val_loss = validate(model, data.valid_dl, loss_func=loss_func,
+                                       cb_handler=cb_handler, pbar=pbar)
+            else: val_loss=None
+            if cb_handler.on_epoch_end(val_loss): break
     except Exception as e:
         exception = e
         raise e
     finally: cb_handler.on_train_end(exception)
 
+loss_func_name2activ = {'cross_entropy_loss': partial(F.softmax, dim=1), 'nll_loss': torch.exp, 'poisson_nll_loss': torch.exp,
+    'kl_div_loss': torch.exp, 'bce_with_logits_loss': F.sigmoid, 'cross_entropy_flat': partial(F.softmax, dim=1),
+    'cross_entropy': partial(F.softmax, dim=1), 'kl_div': torch.exp, 'binary_cross_entropy_with_logits': F.sigmoid
+}
+
+def _loss_func2activ(loss_func):
+    cls_name = camel2snake(loss_func.__class__.__name__)
+    if cls_name == 'mix_up_loss':
+        loss_func = loss_func.crit
+        cls_name = camel2snake(loss_func.__class__.__name__)
+    if cls_name in loss_func_name2activ:
+        if cls_name == 'poisson_nll_loss' and (not getattr(loss_func, 'log_input', True)): return
+        return loss_func_name2activ[cls_name]
+    if hasattr(loss_func, 'func'):
+        if loss_func.func.__name__ == 'poisson_nll_loss' and (not loss_func.keywords.get('log_input', True)): return
+        loss_func = loss_func.func
+    if getattr(loss_func,'__name__','') in loss_func_name2activ:
+        return loss_func_name2activ[loss_func.__name__]
+    return
+
 @dataclass
 class Learner():
-    "Train `model` using `data` to minimize `loss_fn` with optimizer `opt_fn`."
+    "Train `model` using `data` to minimize `loss_func` with optimizer `opt_func`."
     data:DataBunch
     model:nn.Module
-    opt_fn:Callable=AdamW
-    loss_fn:Callable=F.cross_entropy
+    opt_func:Callable=AdamW
+    loss_func:Callable=None
     metrics:Collection[Callable]=None
     true_wd:bool=True
     bn_wd:bool=True
@@ -113,6 +136,7 @@ class Learner():
         self.path = Path(ifnone(self.path, self.data.path))
         (self.path/self.model_dir).mkdir(parents=True, exist_ok=True)
         self.model = self.model.to(self.data.device)
+        self.loss_func = ifnone(self.loss_func, self.data.loss_func)
         self.metrics=listify(self.metrics)
         if not self.layer_groups: self.layer_groups = [nn.Sequential(*flatten_model(self.model))]
         self.callbacks = listify(self.callbacks)
@@ -134,12 +158,12 @@ class Learner():
         if wd is None: wd = self.wd
         self.create_opt(lr, wd)
         callbacks = [cb(self) for cb in self.callback_fns] + listify(callbacks)
-        fit(epochs, self.model, self.loss_fn, opt=self.opt, data=self.data, metrics=self.metrics,
+        fit(epochs, self.model, self.loss_func, opt=self.opt, data=self.data, metrics=self.metrics,
             callbacks=self.callbacks+callbacks)
 
     def create_opt(self, lr:Floats, wd:Floats=0.)->None:
         "Create optimizer with `lr` learning rate and `wd` weight decay."
-        self.opt = OptimWrapper.create(self.opt_fn, lr, self.layer_groups, wd=wd, true_wd=self.true_wd, bn_wd=self.bn_wd)
+        self.opt = OptimWrapper.create(self.opt_func, lr, self.layer_groups, wd=wd, true_wd=self.true_wd, bn_wd=self.bn_wd)
 
     def split(self, split_on:SplitFuncOrIdxList)->None:
         "Split the model at `split_on`."
@@ -164,17 +188,41 @@ class Learner():
 
     def __del__(self): del(self.model, self.data)
 
-    def save(self, name:PathOrStr):
-        "Save model with `name` to `self.model_dir`."
-        torch.save(self.model.state_dict(), self.path/self.model_dir/f'{name}.pth')
+    def save(self, name:PathOrStr, return_path:bool=False)->Union[None,str]:
+        "Save model with `name` to `self.model_dir`, and return path if `return_path`."
+        path = self.path/self.model_dir/f'{name}.pth'
+        torch.save(self.model.state_dict(), path)
+        if return_path: return path
 
-    def load(self, name:PathOrStr):
-        "Load model `name` from `self.model_dir`."
-        self.model.load_state_dict(torch.load(self.path/self.model_dir/f'{name}.pth'))
+    def load(self, name:PathOrStr, device:torch.device=None):
+        "Load model `name` from `self.model_dir` using `device`, defaulting to `self.data.device`."
+        if device is None: device = self.data.device
+        self.model.load_state_dict(torch.load(self.path/self.model_dir/f'{name}.pth', map_location=device))
 
-    def get_preds(self, is_test:bool=False) -> List[Tensor]:
+    def get_preds(self, is_test:bool=False, with_loss:bool=False, n_batch:Optional[int]=None, pbar:Optional[PBar]=None) -> List[Tensor]:
         "Return predictions and targets on the valid or test set, depending on `is_test`."
-        return get_preds(self.model, self.data.holdout(is_test), cb_handler=CallbackHandler(self.callbacks))   
+        lf = self.loss_func if with_loss else None
+        return get_preds(self.model, self.data.holdout(is_test), cb_handler=CallbackHandler(self.callbacks),
+                         activ=_loss_func2activ(self.loss_func), loss_func=lf, n_batch=n_batch, pbar=pbar)
+
+    def pred_batch(self, is_test:bool=False, pbar:Optional[PBar]=None) -> List[Tensor]:
+        "Return output of the model on one batch from valid or test set, depending on `is_test`."
+        dl = self.data.holdout(is_test)
+        nw = dl.num_workers
+        dl.num_workers = 0
+        preds,_ = self.get_preds(is_test, with_loss=False, n_batch=1, pbar=pbar)
+        dl.num_workers = nw
+        return preds
+
+    def validate(self, dl=None, callbacks=None, metrics=None):
+        "Validate on `dl` with potential `callbacks` and `metrics`."
+        dl = ifnone(dl, self.data.valid_dl)
+        metrics = ifnone(metrics, self.metrics)
+        cb_handler = CallbackHandler(self.callbacks + ifnone(callbacks, []), metrics)
+        cb_handler.on_epoch_begin()
+        val_metrics = validate(self.model, dl, self.loss_func, cb_handler)
+        cb_handler.on_epoch_end(val_metrics)
+        return cb_handler.state_dict['last_metrics']
 
 @dataclass
 class LearnerCallback(Callback):
@@ -194,12 +242,11 @@ class Recorder(LearnerCallback):
         self.opt = self.learn.opt
         self.train_dl = self.learn.data.train_dl
 
-    def on_train_begin(self, pbar:PBar, metrics:MetricFuncList, **kwargs:Any)->None:
+    def on_train_begin(self, pbar:PBar, metrics_names:Collection[str], **kwargs:Any)->None:
         "Initialize recording status at beginning of training."
         self.pbar = pbar
-        self.names = ['epoch', 'train loss', 'valid loss'] + [fn.__name__ for fn in metrics]
-        if hasattr(self, '_added_met_names'): self.names += self._added_met_names
-        self.pbar.write('  '.join(self.names))
+        self.names = ['epoch', 'train_loss', 'valid_loss'] + metrics_names
+        self.pbar.write('  '.join(self.names), table=True)
         self.losses,self.val_losses,self.lrs,self.moms,self.metrics,self.nb_batches = [],[],[],[],[],[]
 
     def on_batch_begin(self, train, **kwargs:Any)->None:
@@ -233,14 +280,14 @@ class Recorder(LearnerCallback):
             t = str(stat) if isinstance(stat, int) else f'{stat:.6f}'
             t += ' ' * (len(name) - len(t))
             str_stats.append(t)
-        self.pbar.write('  '.join(str_stats))
-        
+        self.pbar.write('  '.join(str_stats), table=True)
+
     def add_metrics(self, metrics):
         self._added_mets = metrics
 
     def add_metric_names(self, names):
         self._added_met_names = names
-        
+
     def plot_lr(self, show_moms=False)->None:
         "Plot learning rate, `show_moms` to include momentum."
         iterations = range_of(self.lrs)
@@ -256,6 +303,8 @@ class Recorder(LearnerCallback):
         losses = self.losses[skip_start:-skip_end] if skip_end > 0 else self.losses[skip_start:]
         _, ax = plt.subplots(1,1)
         ax.plot(lrs, losses)
+        ax.set_ylabel("Loss")
+        ax.set_xlabel("Learning Rate")
         ax.set_xscale('log')
 
     def plot_losses(self)->None:
